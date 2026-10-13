@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -12,7 +13,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import __version__, api, auth, update
+from . import __version__, api, auth, commands, update
 
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 
@@ -154,6 +155,79 @@ def _write(root: Path, published: str, data: bytes) -> Path:
     return dest
 
 
+def _capabilities(args) -> dict | None:
+    """--capability NAME[=JSON] flags as a declaration; {} for --clear-capabilities."""
+    if args.clear_capabilities:
+        if args.capability:
+            raise SystemExit("error: --clear-capabilities and --capability don't combine")
+        return {}
+    if not args.capability:
+        return None
+    caps: dict = {}
+    for spec in args.capability:
+        name, sep, raw = spec.partition("=")
+        name = name.strip()
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", name):
+            raise SystemExit(f"error: {name!r} is not a capability name")
+        try:
+            caps[name] = json.loads(raw) if sep else {}
+        except ValueError as exc:
+            raise SystemExit(f"error: --capability {name}: invalid JSON: {exc}") from None
+    return caps
+
+
+def _contract_fields(client: api.FrameClient, slug: str | None, args) -> dict:
+    """The deploy fields for --contract and --capability.
+
+    A declaration needs a contract: the one passed, else the artifact's stored
+    one, else the latest. Names are checked against that contract's roster.
+    """
+    caps = _capabilities(args)
+    contract = args.contract
+    if caps is None and contract is None:
+        return {}
+    if contract is None and slug:
+        with contextlib.suppress(api.ApiError):
+            stored = client.access(slug).get("contract")
+            if isinstance(stored, str) and stored != "0.0.0":
+                contract = stored
+    roster = client.contract(contract or "latest")
+    contract = roster.get("version") or contract
+    known = set(roster.get("capabilities") or [])
+    unknown = sorted(set(caps or {}) - known)
+    if unknown:
+        raise SystemExit(
+            f"error: contract {contract} has no capability {', '.join(unknown)}; "
+            f"it supports: {', '.join(sorted(known)) or '(none)'}"
+        )
+    fields: dict = {"contract": contract}
+    if caps is not None:
+        fields["capabilities"] = caps
+    return fields
+
+
+def _copies(client: api.FrameClient, specs: list[list[str]]) -> list[api.Copy]:
+    """--copy SOURCE PUB[=SRC]: files the server copies from another artifact."""
+    copies = []
+    readers: dict[str, api.FileReader] = {}
+    for source, spec in specs:
+        published, _, src = spec.partition("=")
+        published, src = published.lstrip("/"), (src or published).lstrip("/")
+        if api.clean_path(published) is None:
+            raise SystemExit(f"error: {published!r} is not a clean relative path")
+        slug = api.slug_from(source)
+        reader = readers.get(slug) or readers.setdefault(slug, client.files(slug))
+        entry = reader.files.get(src)
+        if entry is None:
+            raise SystemExit(f"error: {source} has no file {src!r} in version {reader.version}")
+        digest = entry.get("sha256")
+        if not isinstance(digest, str):
+            digest = hashlib.sha256(reader.fetch(src)).hexdigest()
+        content_type = entry.get("contentType") or api.guess_content_type(src)
+        copies.append(api.Copy(published, slug, src, reader.version, digest, content_type))
+    return copies
+
+
 # -- commands --------------------------------------------------------------
 
 
@@ -241,13 +315,21 @@ def cmd_publish(args) -> int:
         ("description", args.description),
         ("icon", args.icon),
         ("label", args.label),
+        ("note", args.note),
     ):
         if value:
             meta[key] = value
+    for key, path in (("thumbnail", args.thumbnail), ("thumbnail_dark", args.thumbnail_dark)):
+        if path:
+            if not Path(path).is_file():
+                raise SystemExit(f"error: no such file: {path}")
+            meta[key] = base64.b64encode(Path(path).read_bytes()).decode("ascii")
 
     progress = (lambda m: None) if args.quiet else (lambda m: _eprint(f"  {m}"))
 
     client = _client(args)
+    meta.update(_contract_fields(client, slug, args))
+    copies = _copies(client, args.copy or [])
     result = client.publish(
         page=page,
         extra=extra,
@@ -258,6 +340,7 @@ def cmd_publish(args) -> int:
         base_version=base_version,
         force=args.force,
         on_progress=progress,
+        copies=copies,
     )
     url = api.ARTIFACT_URL.format(slug=result["slug"])
 
@@ -289,6 +372,8 @@ def cmd_list(args) -> int:
         want = "mine" if args.scope == "mine" else "shared"
         frames = [f for f in frames if (f.get("rel") or "mine") == want]
     frames = [f for f in frames if not f.get("softDeleted")]
+    if args.pinned:
+        frames = [f for f in frames if f.get("starred")]
 
     if args.json:
         print(json.dumps(frames, indent=2))
@@ -330,6 +415,11 @@ def cmd_read(args) -> int:
     role = (data.get("perm") or {}).get("role")
     print(f"  role       {role or '?'}"
           f"{'  (public)' if access.get('public') else ''}")
+    if access.get("contract") and access.get("contract") != "0.0.0":
+        print(f"  contract   {access['contract']}")
+    caps = access.get("capabilities")
+    if isinstance(caps, dict) and caps:
+        print(f"  caps       {', '.join(sorted(caps))}")
 
     files = data.get("files") or []
     if files:
@@ -627,12 +717,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="version this publish was made against; a newer live version is refused",
     )
     p.add_argument("--force", action="store_true", help="overwrite a newer version")
+    p.add_argument(
+        "--capability",
+        action="append",
+        metavar="NAME[=JSON]",
+        help="declare a runtime capability, e.g. db, user, assets, 'downloads=true'; "
+        "repeatable; replaces the stored declaration (see `claude-artifact contract --prompt`)",
+    )
+    p.add_argument(
+        "--clear-capabilities", action="store_true", help="drop every declared capability"
+    )
+    p.add_argument(
+        "--contract",
+        metavar="VERSION",
+        help="runtime contract to pin, or 'latest' to upgrade (default: keep the stored one)",
+    )
+    p.add_argument(
+        "--copy",
+        nargs=2,
+        action="append",
+        metavar=("SOURCE", "PUB[=SRC]"),
+        help="have the server copy a published file from another artifact; repeatable",
+    )
+    p.add_argument("--note", help="note recorded with this version")
+    p.add_argument("--thumbnail", metavar="IMAGE", help="gallery thumbnail image")
+    p.add_argument("--thumbnail-dark", metavar="IMAGE", help="dark-mode gallery thumbnail")
     p.add_argument("-q", "--quiet", action="store_true")
     p.set_defaults(func=cmd_publish)
 
     p = sub.add_parser("list", parents=[common], help="list your artifacts")
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--scope", choices=["mine", "shared", "all"], default="mine")
+    p.add_argument("--pinned", action="store_true", help="only pinned artifacts")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("read", parents=[common], help="metadata, manifest, or a file's bytes")
@@ -668,6 +784,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--url", help="artifact URL to compare with")
     p.set_defaults(func=cmd_status)
 
+    _add_more(sub, common)
+
     p = sub.add_parser("update", help="upgrade this CLI to the latest release now")
     p.set_defaults(func=update.cmd_update)
 
@@ -675,6 +793,186 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_whoami)
 
     return parser
+
+
+def _add_more(sub, common) -> None:
+    """Parsers for comments, db, assets, types, sharing and housekeeping."""
+
+    def slug_arg(p):
+        p.add_argument("slug", help="slug or full artifact URL")
+
+    # comments
+    p = sub.add_parser("comments", help="read, reply to and resolve comment threads")
+    csub = p.add_subparsers(dest="comments_command", required=True)
+    c = csub.add_parser("list", parents=[common], help="comment threads (open ones by default)")
+    slug_arg(c)
+    which = c.add_mutually_exclusive_group()
+    which.add_argument("--all", action="store_true", help="include resolved threads")
+    which.add_argument(
+        "--awaiting", action="store_true", help="only threads waiting on a reply from Claude"
+    )
+    c.add_argument("--full", action="store_true", help="don't shorten comment text")
+    c.set_defaults(func=commands.cmd_comments_list)
+    c = csub.add_parser(
+        "reply", parents=[common], help="reply as Claude on a thread sent to Claude"
+    )
+    slug_arg(c)
+    c.add_argument("thread", help="thread id (from `comments list`)")
+    c.add_argument("text", help="reply text, or - for stdin")
+    c.add_argument(
+        "--id", help="client id (UUID) making a retry idempotent (default: a fresh one)"
+    )
+    c.set_defaults(func=commands.cmd_comments_reply)
+    c = csub.add_parser("resolve", parents=[common], help="resolve threads sent to Claude")
+    slug_arg(c)
+    c.add_argument("thread", nargs="+", help="thread id(s)")
+    c.set_defaults(func=commands.cmd_comments_resolve)
+
+    # db
+    p = sub.add_parser("db", help="read and write an artifact's database")
+    dsub = p.add_subparsers(dest="db_command", required=True)
+
+    def db_parser(name, help_text, doc=True):
+        d = dsub.add_parser(name, parents=[common], help=help_text)
+        slug_arg(d)
+        d.add_argument(
+            "collection", help="collection path (odd segments, e.g. tasks or data/users/me)"
+        )
+        if doc:
+            d.add_argument("doc", help="document id")
+        d.set_defaults(func=commands.cmd_db)
+        return d
+
+    db_parser("get", "one document")
+    for name, help_text in (("list", "documents in a collection"), ("query", "filtered documents")):
+        d = db_parser(name, help_text, doc=False)
+        d.add_argument("--limit", type=int)
+        d.add_argument("--cursor", help="nextCursor from an earlier page")
+        d.add_argument("--all", action="store_true", help="follow every page")
+        if name == "query":
+            d.add_argument(
+                "--where",
+                nargs=3,
+                action="append",
+                metavar=("FIELD", "OP", "VALUE"),
+                help="OP: == != < <= > >= in not-in array-contains; VALUE is JSON or a string",
+            )
+            d.add_argument("--order-by", metavar="FIELD[:asc|desc]")
+    for name, help_text in (
+        ("set", "create or replace a document"),
+        ("update", "merge fields into a document ({\"__delete__\": true} drops one)"),
+    ):
+        d = db_parser(name, help_text)
+        d.add_argument("--data", help="JSON object, - for stdin, or @FILE")
+        d.add_argument("--if-version", type=int, help="refuse unless the document is at this version")
+    d = db_parser("delete", "delete a document")
+    d.add_argument("--if-version", type=int)
+    d = db_parser("edit", "replace text inside one string field")
+    d.add_argument("--field", required=True)
+    d.add_argument("--old", required=True, help="text to find")
+    d.add_argument("--new", required=True, help="replacement text")
+    d.add_argument("--replace-all", action="store_true")
+    d.add_argument("--if-version", type=int)
+    d = dsub.add_parser("batch", parents=[common], help="several writes in one request")
+    slug_arg(d)
+    d.add_argument(
+        "writes",
+        help="JSON list of {op, collection, doc_id, data?, if_version?}; - for stdin, or @FILE",
+    )
+    d.set_defaults(func=commands.cmd_db)
+    d = dsub.add_parser("whoami", parents=[common], help="your id for data/users/<id>")
+    slug_arg(d)
+    d.set_defaults(func=commands.cmd_db)
+
+    # assets
+    p = sub.add_parser("assets", help="an artifact's uploaded asset store")
+    asub = p.add_subparsers(dest="assets_command", required=True)
+    a = asub.add_parser("list", parents=[common], help="uploaded assets and usage")
+    slug_arg(a)
+    a = asub.add_parser("upload", parents=[common], help="upload files; prints id and url")
+    slug_arg(a)
+    a.add_argument("file", nargs="+")
+    a.add_argument("--type", help="content type (default: from the extension)")
+    a = asub.add_parser("get", parents=[common], help="an asset's bytes")
+    slug_arg(a)
+    a.add_argument("id", help="asset id (32 hex characters)")
+    a.add_argument("-o", "--out", help="write to this file instead of stdout")
+    a = asub.add_parser("delete", parents=[common], help="delete assets for good")
+    slug_arg(a)
+    a.add_argument("id", nargs="+")
+    a = asub.add_parser("copy", parents=[common], help="copy assets from another artifact")
+    slug_arg(a)
+    a.add_argument("--from", dest="source", required=True, help="artifact to copy from")
+    a.add_argument("id", nargs="+", help="asset ids on the source (1-10)")
+    for a in asub.choices.values():
+        a.set_defaults(func=commands.cmd_assets)
+
+    # types
+    p = sub.add_parser("types", help="Artifact types (Slides, Docs, Dashboard, ...)")
+    tsub = p.add_subparsers(dest="types_command", required=True)
+    tsub.add_parser("list", parents=[common], help="types this account can create from")
+    t = tsub.add_parser("show", parents=[common], help="a type's metadata and files")
+    t.add_argument("type", help="type title (e.g. slides), slug or URL")
+    t = tsub.add_parser("read", parents=[common], help="a text file the type ships")
+    t.add_argument("type", help="type title, slug or URL")
+    t.add_argument("path", help="e.g. SKILL.md")
+    t = tsub.add_parser("instances", parents=[common], help="artifacts made from a type")
+    t.add_argument("type", help="type title, slug or URL")
+    t.add_argument("--limit", type=int, default=50)
+    for t in tsub.choices.values():
+        t.set_defaults(func=commands.cmd_types)
+
+    p = sub.add_parser("create", parents=[common], help="start a new artifact from a type")
+    p.add_argument("type", help="type title (e.g. slides), slug or URL")
+    p.add_argument("--title")
+    p.add_argument("--idempotency-key", help="reuse to make a retried create safe")
+    p.add_argument("-q", "--quiet", action="store_true")
+    p.set_defaults(func=commands.cmd_create)
+
+    p = sub.add_parser("contract", parents=[common], help="runtime contract and capabilities")
+    p.add_argument("version", nargs="?", default="latest")
+    p.add_argument(
+        "--prompt", action="store_true", help="print the capability guide for page authors"
+    )
+    p.set_defaults(func=commands.cmd_contract)
+
+    # sharing and housekeeping
+    p = sub.add_parser("share", parents=[common], help="show or change who can open an artifact")
+    slug_arg(p)
+    p.add_argument("--private", action="store_true", help="only the owner")
+    p.add_argument("--org", action="store_true", help="everyone in the organization")
+    p.add_argument("--add", action="append", metavar="ACCOUNT_UUID", help="share with a person")
+    p.add_argument("--remove", action="append", metavar="ACCOUNT_UUID", help="unshare a person")
+    p.add_argument(
+        "--access", choices=["view", "comment"], default="comment", help="for --add (default comment)"
+    )
+    p.set_defaults(func=commands.cmd_share)
+
+    p = sub.add_parser("versions", parents=[common], help="version history")
+    slug_arg(p)
+    p.set_defaults(func=commands.cmd_versions)
+
+    p = sub.add_parser("rename", parents=[common], help="change the title")
+    slug_arg(p)
+    p.add_argument("title")
+    p.set_defaults(func=commands.cmd_rename)
+
+    for name, help_text in (("pin", "pin to your sidebar"), ("unpin", "unpin")):
+        p = sub.add_parser(name, parents=[common], help=help_text)
+        slug_arg(p)
+        p.set_defaults(func=commands.cmd_pin)
+
+    p = sub.add_parser("delete", parents=[common], help="delete an artifact for everyone")
+    slug_arg(p)
+    p.add_argument("--yes", action="store_true", help="confirm; there is no undo")
+    p.set_defaults(func=commands.cmd_delete)
+
+    p = sub.add_parser("watch", parents=[common], help="print new versions and comments as they land")
+    slug_arg(p)
+    p.add_argument("--interval", type=float, default=30, help="seconds between polls (default 30)")
+    p.add_argument("--count", type=int, help="exit after this many events")
+    p.add_argument("--no-comments", action="store_true", help="only watch versions")
+    p.set_defaults(func=commands.cmd_watch)
 
 
 def main(argv: list[str] | None = None) -> int:

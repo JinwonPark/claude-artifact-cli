@@ -128,6 +128,18 @@ class Asset:
         return len(json.dumps(self.wire())) - 2
 
 
+@dataclass
+class Copy:
+    """A file the server copies from another artifact's published version."""
+
+    path: str
+    from_slug: str
+    from_path: str
+    from_ver: str
+    sha256: str
+    content_type: str
+
+
 def guess_content_type(path: str) -> str:
     guessed, _ = mimetypes.guess_type(path)
     if guessed == "application/x-javascript":
@@ -233,6 +245,22 @@ class FileReader:
             raise ApiError(f"{path!r} doesn't match its published sha256")
         return data
 
+    def fetch_asset(self, asset_id: str, sha256: str | None = None) -> bytes:
+        """An uploaded asset's bytes, checked against `sha256` when given."""
+        if not re.fullmatch(r"[0-9a-f]{32}", asset_id):
+            raise ApiError(f"{asset_id!r} is not an asset id (32 hex characters)")
+        status, data = self._get(f"/_f/{self.version}/_blob/{asset_id}")
+        if status in (401, 403):
+            self._boot()
+            status, data = self._get(f"/_f/{self.version}/_blob/{asset_id}")
+        if status == 404:
+            raise ApiError(f"no asset {asset_id} on this artifact", 404)
+        if status != 200:
+            raise ApiError(f"reading asset {asset_id} failed with HTTP {status}", status)
+        if sha256 and hashlib.sha256(data).hexdigest() != sha256:
+            raise ApiError(f"asset {asset_id} doesn't match its sha256")
+        return data
+
     def _fetch(self, path: str, quoted: str) -> tuple[int, bytes, bool]:
         """(status, bytes, whether either request was refused for its token)."""
         denied = False
@@ -302,6 +330,10 @@ def slug_from(value: str) -> str:
     raise ApiError(f"not a valid artifact slug or URL: {value!r}")
 
 
+def _q(value: str) -> str:
+    return urllib.parse.quote(value, safe="")
+
+
 class FrameClient:
     def __init__(self, token: str, base: str = DEFAULT_BASE, timeout: int = 120):
         self.token = token
@@ -323,25 +355,39 @@ class FrameClient:
             "User-Agent": f"claude-artifact-cli/{CLIENT_VERSION}",
         }
 
-    def _request(self, method: str, path: str, body: dict | None = None) -> Any:
-        data = json.dumps(body).encode("utf-8") if body is not None else None
-        req = urllib.request.Request(
-            f"{self.base}{path}", data=data, headers=self._headers(), method=method
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: dict | None = None,
+        *,
+        raw: bytes | None = None,
+        content_type: str | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        """One API call. `raw` sends bytes as-is under `content_type` instead of JSON."""
+        data = raw if raw is not None else (
+            json.dumps(body).encode("utf-8") if body is not None else None
         )
+        sent = self._headers()
+        if content_type:
+            sent["Content-Type"] = content_type
+        sent.update(headers or {})
+        req = urllib.request.Request(f"{self.base}{path}", data=data, headers=sent, method=method)
         try:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read()
+                raw_reply = resp.read()
                 status = resp.status
         except urllib.error.HTTPError as exc:
-            raw = exc.read()
+            raw_reply = exc.read()
             status = exc.code
         except urllib.error.URLError as exc:
             raise ApiError(f"network error talking to {self.base}: {exc.reason}") from exc
 
         try:
-            parsed = json.loads(raw) if raw else None
+            parsed = json.loads(raw_reply) if raw_reply else None
         except json.JSONDecodeError:
-            parsed = raw.decode("utf-8", "replace")
+            parsed = raw_reply.decode("utf-8", "replace")
 
         if status == 401:
             raise ApiError(
@@ -351,7 +397,12 @@ class FrameClient:
                 parsed,
             )
         if status == 409:
-            raise ConflictError(_describe_conflict(parsed), status, parsed)
+            message = (
+                _describe_conflict(parsed)
+                if path.startswith("/api/frame/deploy/")
+                else _describe(status, parsed)
+            )
+            raise ConflictError(message, status, parsed)
         if status >= 400:
             raise ApiError(_describe(status, parsed), status, parsed)
         return parsed
@@ -374,12 +425,15 @@ class FrameClient:
         bytes themselves come from files().
         """
         boot = redact(self._boot(slug))
-        quoted = urllib.parse.quote(slug)
         try:
-            boot["_access"] = redact(self._request("GET", f"/api/frame/read/{quoted}"))
+            boot["_access"] = self.access(slug)
         except ApiError:
             pass
         return boot
+
+    def access(self, slug: str) -> dict:
+        """Ownership, sharing, and the stored contract and capabilities."""
+        return redact(self._request("GET", f"/api/frame/read/{_q(slug)}"))
 
     def _boot(self, slug: str) -> dict:
         """The raw boot response. It holds live tokens: never return it to callers."""
@@ -395,6 +449,158 @@ class FrameClient:
         """A reader for the published bytes of the artifact's live version."""
         return FileReader(self, slug)
 
+    def versions(self, slug: str) -> dict:
+        """Version history: live, history (newest first) and per-version metadata."""
+        return redact(self._request("GET", f"/api/frame/versions/{_q(slug)}"))
+
+    def retitle(self, slug: str, title: str) -> dict:
+        """Rename. The server records the new title as a new version."""
+        return redact(self._request("POST", f"/api/frame/retitle/{_q(slug)}", {"title": title}))
+
+    def pin(self, slug: str, pinned: bool = True) -> None:
+        self._request("POST" if pinned else "DELETE", f"/api/frame/favorite/{_q(slug)}")
+
+    def delete(self, slug: str) -> None:
+        """Delete the artifact for everyone. There is no undo."""
+        self._request("DELETE", f"/api/frame/{_q(slug)}")
+
+    # -- sharing -----------------------------------------------------------
+
+    def sharing(self, slug: str) -> dict:
+        return redact(self._request("GET", f"/api/frame/perm/{_q(slug)}"))
+
+    def set_sharing(self, slug: str, change: dict, version: str) -> dict:
+        """PATCH the sharing settings read at `version`; a change made since is refused."""
+        return redact(
+            self._request(
+                "PATCH", f"/api/frame/perm/{_q(slug)}", change, headers={"If-Match": version}
+            )
+        )
+
+    # -- comments ----------------------------------------------------------
+
+    def comments(self, slug: str) -> dict:
+        """Every comment thread, with `names` mapping account ids to display names."""
+        return redact(self._request("GET", f"/api/frame/comments/{_q(slug)}?names=1"))
+
+    def reply(
+        self, slug: str, thread: str, text: str, client_id: str, answers_summon: bool = False
+    ) -> dict:
+        """Reply as Claude on a thread a person sent to Claude.
+
+        `client_id` makes the post idempotent: resending it answers `replayed`
+        instead of posting twice.
+        """
+        body: dict[str, Any] = {"id": client_id, "text": text}
+        if answers_summon:
+            body["answers_summon"] = True
+        data = self._request(
+            "POST", f"/api/frame/comments/{_q(slug)}/{_q(thread)}", body
+        )
+        if not isinstance(data, dict) or "comment_id" not in data:
+            raise ApiError("comment reply returned an unexpected response", body=data)
+        return redact({k: v for k, v in data.items() if k != "payload"})
+
+    def resolve(self, slug: str, thread: str) -> None:
+        """Resolve a thread a person sent to Claude."""
+        self._request(
+            "POST",
+            f"/api/frame/comments/{_q(slug)}/{_q(thread)}/session-resolve",
+            {"resolved": True},
+        )
+
+    # -- database ----------------------------------------------------------
+
+    def db(self, slug: str, verb: str, args: dict) -> dict:
+        """One artifact-database call: get, list, query, set, update, delete,
+        str_replace, batch or whoami."""
+        data = self._request(
+            "POST", "/api/frame/db/agent", {"slug": slug, "verb": verb, "args": args}
+        )
+        if not isinstance(data, dict):
+            raise ApiError("db returned an unexpected response", body=data)
+        return redact(data)
+
+    # -- assets ------------------------------------------------------------
+
+    def assets(self, slug: str, after: str | None = None, limit: int = 50) -> dict:
+        body: dict[str, Any] = {"limit": limit}
+        if after:
+            body["after"] = after
+        return redact(self._request("POST", f"/api/frame/blob/{_q(slug)}/agent-list", body))
+
+    def upload_asset(self, slug: str, data: bytes, content_type: str) -> dict:
+        reply = self._request(
+            "POST",
+            f"/api/frame/blob/{_q(slug)}/agent-upload",
+            raw=data,
+            content_type=content_type,
+        )
+        if not isinstance(reply, dict) or "opaque_id" not in reply:
+            raise ApiError("asset upload returned an unexpected response", body=reply)
+        return redact(reply)
+
+    def delete_asset(self, slug: str, asset_id: str) -> dict:
+        return redact(
+            self._request(
+                "POST", f"/api/frame/blob/{_q(slug)}/{_q(asset_id)}/agent-delete", {}
+            )
+        )
+
+    def copy_assets(self, slug: str, from_slug: str, ids: list[str]) -> dict:
+        return redact(
+            self._request(
+                "POST",
+                f"/api/frame/blob/{_q(slug)}/agent-copy",
+                {"from": from_slug, "ids": ids},
+            )
+        )
+
+    # -- types and contracts -----------------------------------------------
+
+    def types(self) -> list[dict]:
+        data = self._request("GET", "/api/frame/types")
+        if isinstance(data, dict) and isinstance(data.get("types"), list):
+            return redact(data["types"])
+        raise ApiError("unexpected types response shape", body=data)
+
+    def type_info(self, slug: str) -> dict:
+        return redact(self._request("GET", f"/api/frame/types/{_q(slug)}"))
+
+    def type_file(self, slug: str, path: str) -> dict:
+        """A text file the type ships, e.g. its SKILL.md: {text, truncated, …}."""
+        quoted = clean_path(path)
+        if quoted is None:
+            raise ApiError(f"{path!r} is not a clean relative path")
+        return redact(self._request("GET", f"/api/frame/types/{_q(slug)}/files/{quoted}"))
+
+    def type_instances(self, slug: str, limit: int = 50) -> list[dict]:
+        data = self._request("GET", f"/api/frame/types/{_q(slug)}/instances?limit={int(limit)}")
+        if isinstance(data, dict) and isinstance(data.get("instances"), list):
+            return redact(data["instances"])
+        raise ApiError("unexpected instances response shape", body=data)
+
+    def create_from_type(self, type_slug: str, title: str | None, key: str) -> dict:
+        """A new artifact made from a type. `key` makes a retried create idempotent."""
+        body: dict[str, Any] = {"target_type_version": None}
+        if title:
+            body["title"] = title
+        data = self._request(
+            "POST",
+            f"/api/frame/types/{_q(type_slug)}/create?idempotency_key={_q(key)}",
+            body,
+        )
+        if not isinstance(data, dict) or not isinstance(data.get("slug"), str):
+            raise ApiError("create returned an incomplete response", body=data)
+        return redact(data)
+
+    def contract(self, version: str = "latest") -> dict:
+        return self._request("GET", f"/api/frame/contract/{_q(version)}")
+
+    def contract_prompt(self, version: str) -> str:
+        data = self._request("GET", f"/api/frame/contract/{_q(version)}/prompt")
+        return data if isinstance(data, str) else json.dumps(data, indent=2)
+
     def publish(
         self,
         page: Asset | None,
@@ -406,6 +612,7 @@ class FrameClient:
         base_version=None,
         force: bool = False,
         on_progress=lambda msg: None,
+        copies: list[Copy] | None = None,
     ) -> dict:
         # "patch" overlays the manifest onto baseVersion, so files left out are
         # kept; "replace" makes the manifest the whole artifact. Updates default
@@ -447,6 +654,8 @@ class FrameClient:
                 f"body is {total // 1024 // 1024} MB - using prepare/upload flow"
             )
             slug, staged = self._stage(extra, slug, on_progress)
+        if copies:
+            slug = self._copy(copies, slug, on_progress)
 
         staged_paths = {a.path for a in staged}
         for asset in assets:
@@ -460,6 +669,8 @@ class FrameClient:
                     "content": asset.wire(),
                     "contentType": asset.content_type,
                 }
+        for copy in copies or []:
+            manifest[copy.path] = {"sha256": copy.sha256, "contentType": copy.content_type}
         for path in removals or []:
             manifest[path] = None
 
@@ -518,6 +729,33 @@ class FrameClient:
             staged.extend(batch)
         return reserved, staged
 
+    def _copy(self, copies: list[Copy], slug: str | None, on_progress) -> str:
+        """Have the server copy files from other artifacts into this one."""
+        if not slug:
+            on_progress("POST /api/frame/deploy/prepare")
+            prep = self._request(
+                "POST", "/api/frame/deploy/prepare", {"shas": [c.sha256 for c in copies]}
+            )
+            if not isinstance(prep, dict) or not isinstance(prep.get("slug"), str):
+                raise ApiError("malformed preflight answer", body=prep)
+            slug = prep["slug"]
+        on_progress(f"POST /api/frame/upload ({len(copies)} copied file(s))")
+        self._request(
+            "POST",
+            "/api/frame/upload",
+            {
+                "slug": slug,
+                "files": [
+                    {
+                        "path": c.path,
+                        "from": {"slug": c.from_slug, "path": c.from_path, "ver": c.from_ver},
+                    }
+                    for c in copies
+                ],
+            },
+        )
+        return slug
+
     def _upload(self, slug: str, batch: list[Asset], on_progress) -> None:
         on_progress(f"POST /api/frame/upload ({len(batch)} file(s))")
         self._request(
@@ -545,13 +783,33 @@ def _describe_conflict(body: Any) -> str:
     )
 
 
+def error_code(body: Any) -> str | None:
+    """The machine-readable code of an error body, e.g. `not_declared`."""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and isinstance(err.get("code"), str):
+            return err["code"]
+        if isinstance(body.get("code"), str):
+            return body["code"]
+    return None
+
+
 def _describe(status: int, body: Any) -> str:
     detail = ""
     if isinstance(body, dict):
-        detail = body.get("message") or body.get("error") or json.dumps(body)[:400]
+        err = body.get("error")
+        if isinstance(err, dict):
+            # {"error": {"code", "message", "reason"?}}: db, assets.
+            parts = [err.get("code"), err.get("message"), err.get("reason")]
+            detail = " - ".join(str(p) for p in parts if p)
+        else:
+            detail = body.get("message") or err or json.dumps(body)[:400]
+            if body.get("code") and isinstance(detail, str):
+                detail = f"{body['code']} - {detail}"
     elif isinstance(body, str):
-        detail = body[:400]
-    hint = {
+        detail = body.strip()[:400]
+    # Generic hints only when the server said nothing more specific.
+    hint = "" if detail else {
         403: " (the account may not have Artifacts enabled)",
         404: " (no such artifact, or it isn't yours to update)",
         413: " (payload too large)",
