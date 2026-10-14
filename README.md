@@ -4,7 +4,7 @@
 
 # claude-artifact-cli
 
-Publish, update, pull, list and inspect Claude Artifacts from the terminal, using the Claude Code login already on your machine.
+Publish, update, pull and inspect Claude Artifacts from the terminal, and work with their comments, database, assets, types and sharing, using the Claude Code login already on your machine.
 
 [![PyPI](https://img.shields.io/pypi/v/claude-artifact-cli?style=for-the-badge)](https://pypi.org/project/claude-artifact-cli/)
 [![Python](https://img.shields.io/pypi/pyversions/claude-artifact-cli?style=for-the-badge)](https://pypi.org/project/claude-artifact-cli/)
@@ -16,7 +16,7 @@ Publish, update, pull, list and inspect Claude Artifacts from the terminal, usin
 
 ## What is this?
 
-`claude-artifact` publishes an HTML page (plus any CSS, JS and images it uses) as a [Claude Artifact](https://claude.ai/code/artifacts) and prints the link, and pulls an artifact's files back down to edit and republish. It talks to the same API the Claude Code `Artifact` tool uses and reuses the claude.ai login from `claude /login`. No API key, no config file, no dependencies beyond Python 3.10+.
+`claude-artifact` publishes an HTML page (plus any CSS, JS and images it uses) as a [Claude Artifact](https://claude.ai/code/artifacts) and prints the link, and pulls an artifact's files back down to edit and republish. It also reads and answers comment threads, reads and writes an artifact's database, manages its uploaded assets, starts artifacts from types (Slides, Docs, Dashboard, …), declares runtime capabilities, and handles sharing, renaming, pinning, history and deletion. It talks to the same API the Claude Code `Artifact` tool uses and reuses the claude.ai login from `claude /login`. No API key, no config file, no dependencies beyond Python 3.10+.
 
 Use it where the built-in tool can't reach: other coding agents (Droid, Codex, Cursor, OpenCode), subagents, shell scripts, Makefiles, git hooks and CI jobs.
 
@@ -50,12 +50,31 @@ claude-artifact list [--scope mine|shared|all] [--limit N]
 claude-artifact read SLUG_OR_URL [-o FILE]  metadata + published file manifest
 claude-artifact read SLUG_OR_URL --path P [--path P ... --out-dir DIR]
                                             a published file's exact bytes
+claude-artifact versions SLUG_OR_URL        version history (* marks live)
+claude-artifact rename SLUG_OR_URL TITLE
+claude-artifact pin|unpin SLUG_OR_URL
+claude-artifact delete SLUG_OR_URL --yes    delete for everyone; no undo
+claude-artifact share SLUG_OR_URL [--private | --org | --add UUID ... [--access view|comment] | --remove UUID ...]
+
+claude-artifact comments list SLUG_OR_URL [--all | --awaiting] [--full]
+claude-artifact comments reply SLUG_OR_URL THREAD TEXT|- [--id UUID]
+claude-artifact comments resolve SLUG_OR_URL THREAD ...
+claude-artifact watch SLUG_OR_URL [--interval S] [--count N] [--no-comments]
+
+claude-artifact db whoami|get|list|query|set|update|delete|edit|batch SLUG_OR_URL ...
+claude-artifact assets list|upload|get|delete|copy SLUG_OR_URL ...
+
+claude-artifact types list | show TYPE | read TYPE PATH | instances TYPE
+claude-artifact create TYPE [--title T]     new artifact from a type (slides, docs, ...)
+claude-artifact contract [VERSION] [--prompt]
+                                            runtime capabilities and the page-author guide
+
 claude-artifact whoami                      check that auth works
 claude-artifact update                      upgrade to the latest release now
 claude-artifact --version
 ```
 
-The URL goes to stdout and progress goes to stderr, so `URL=$(claude-artifact publish page.html -q)` captures only the link. Add `--json` to `publish`, `status`, `list` or `read` for raw output. Exit codes: `0` success, `1` API error, `2` auth error, `3` version conflict (HTTP 409), `130` interrupted.
+The URL goes to stdout and progress goes to stderr, so `URL=$(claude-artifact publish page.html -q)` captures only the link. Add `--json` to any command that prints data for raw output. Exit codes: `0` success, `1` API error, `2` auth error, `3` version conflict (HTTP 409: a newer artifact version, or a database document that changed since `--if-version`), `130` interrupted.
 
 Wherever a command takes a slug or URL (`SLUG_OR_URL`, `--slug`, `--url`), it accepts any of:
 
@@ -100,6 +119,12 @@ claude-artifact publish index.html --slug <slug> \
 | `--mode patch\|replace` | `patch` overlays the manifest onto the base version, so published files you don't pass are kept. Default when updating a page. `replace` makes the manifest the whole artifact, so any published file you leave out is removed. Default for a new artifact and for the first publish of a directory. A directory with `.artifact.json` patches (see below). |
 | `--base-version` | The version this publish was made against. If a newer version is live, the publish is refused with exit code `3`. Defaults to the version in a directory's `.artifact.json` (when publishing to the slug saved there). Without one, patch uses the live version and replace is not checked, so a concurrent publish goes undetected. |
 | `--force` | Publish even if a newer version is live, discarding it. |
+| `--capability NAME[=JSON]` | Declare a runtime capability the page uses: `db`, `user`, `assets`, `comments`, `artifact`, `downloads`, … with its config (default `{}`), e.g. `--capability 'db={"rules":[…]}'`. Repeatable. The set you pass replaces the stored declaration; a publish without `--capability` keeps it. Names are checked against the contract. `claude-artifact contract --prompt` documents each one. |
+| `--clear-capabilities` | Drop every declared capability. |
+| `--contract VERSION` | Pin the runtime contract, or `latest` to upgrade. Default: the artifact's stored contract; a declaration on an artifact without one uses the latest. |
+| `--copy SOURCE PUB[=SRC]` | Have the server copy published file `SRC` (default `PUB`) from artifact `SOURCE` into this one at `PUB`. Nothing is downloaded or re-uploaded. Repeatable. The server copies scripts, styles, data, fonts and images, not HTML or XML. |
+| `--note TEXT` | A note recorded with this version; `versions` shows it. |
+| `--thumbnail IMAGE`, `--thumbnail-dark IMAGE` | Gallery thumbnails. |
 | `-q`, `--quiet` | Print only the URL. |
 
 `--json` prints the deploy response with the artifact `url` added: `{"url", "slug", "version", …}`.
@@ -196,7 +221,112 @@ claude-artifact read <slug> --path index.html --path app.css --out-dir ./out   #
 
 `read --path P` prints the published file's exact bytes to stdout instead, checked against the manifest's sha256. Repeat `--path` with `--out-dir DIR` to save several files under `DIR` at their published paths; it prints each saved path. `--path` doesn't combine with `--json` or `-o`, more than one `--path` needs `--out-dir`, and `--out-dir` needs `--path`.
 
+`read` also shows the artifact's runtime contract and declared capabilities. `list --pinned` shows only pinned artifacts.
+
 Never WebFetch or curl a `claude.ai` artifact URL: it is a login-walled app shell and returns no page content.
+
+### Comments
+
+```bash
+claude-artifact comments list <slug>             # open threads, with authors and anchors
+claude-artifact comments list <slug> --awaiting  # threads a person sent to Claude that have no answer yet
+claude-artifact comments reply <slug> <thread> "Fixed in the latest version."
+echo "Long answer" | claude-artifact comments reply <slug> <thread> -
+claude-artifact comments resolve <slug> <thread>
+```
+
+`list` shows open threads; `--all` adds resolved ones and `--full` keeps long comments whole. Each thread prints its id, its state (`resolved`, `sent to Claude`, `awaiting Claude`), what it is anchored to, and every comment.
+
+`reply` posts **as Claude**, and only on a thread a person sent to Claude ("Send to Claude" on the artifact's page); anything else is refused, as it is for Claude Code's Artifact tool. When the thread is waiting on Claude, the reply marks that request answered. Each reply carries a client id (`--id`, default a fresh UUID); resending the same id posts nothing new, so a retry after a network error is safe. `resolve` works on the same threads. Starting a thread, and replying or resolving as yourself, need a claude.ai browser session: do those on the artifact's page.
+
+### Watch
+
+```bash
+claude-artifact watch <slug>                     # prints events until Ctrl-C
+claude-artifact watch <slug> --json --count 1    # wait for the next event, print it as JSON, exit
+```
+
+Polls every `--interval` seconds (default 30) and prints one line per new version, new comment (`[to Claude]` when a person sent it to Claude) and resolved thread. `--json` prints one JSON object per line: `{"event": "version", "version", "previous"}`, `{"event": "comment", "thread", "comment", "author", "text", "to_claude", "awaiting_claude"}` or `{"event": "resolved", "thread", "at"}`. `--no-comments` watches versions only. Publishing identical content creates no new version, so it prints nothing.
+
+### Database
+
+An artifact's database holds shared and per-person JSON documents its page reads with `claude.use("db")`. The page's published version must declare the capability: `publish … --capability db --capability user`.
+
+```bash
+claude-artifact db set    <slug> tasks t1 --data '{"title": "Ship it", "done": false}'
+claude-artifact db update <slug> tasks t1 --data '{"done": true}' --if-version 1
+claude-artifact db get    <slug> tasks t1
+claude-artifact db list   <slug> tasks --all
+claude-artifact db query  <slug> tasks --where done == false --where n '>=' 2 --order-by n:desc
+claude-artifact db edit   <slug> notes n1 --field body --old "teh" --new "the" --replace-all
+claude-artifact db delete <slug> tasks t1
+claude-artifact db batch  <slug> @writes.json    # [{"op":"set","collection":"tasks","doc_id":"t2","data":{…}}, …]
+claude-artifact db whoami <slug>                 # your id, as in data/users/<id>
+```
+
+| Rule | |
+|------|--|
+| Paths | A collection is 1-15 `/`-separated segments with an odd count (`tasks`, `boards/b1/columns`); a document is collection + doc id. Segments use letters, digits and `_ - . ~ : @ +`. |
+| Per-person data | `data/users/<id>` is private to that person, even from the owner. `me` stands for you: `db get <slug> data/users/me prefs`. |
+| `set` / `update` | `set` replaces the document; `update` merges fields, and `{"__delete__": true}` removes one. `--data` takes JSON, `-` for stdin, or `@FILE`. |
+| `--if-version N` | The write applies only if the document is still at version `N`. Otherwise nothing is written and the command exits `3`. |
+| `edit` | Replaces text inside one string field without resending the document. |
+| `query` | `--where FIELD OP VALUE` with `==` `!=` `<` `<=` `>` `>=` `in` `not-in` `array-contains`. `VALUE` is parsed as JSON when it can be, else taken as a string. |
+| Paging | `list` and `query` print `--cursor` for the next page; `--all` follows every page. |
+| `batch` | 1-50 `set`/`update`/`delete` writes, `{op, collection, doc_id, data?, if_version?}`, each document at most once, up to 1 MiB, in one request. |
+
+`get` prints the document's data (stderr has its version); a missing document exits `1`. List and query print `id`, `v<version>` and the data, tab-separated.
+
+### Assets
+
+The asset store holds files a page uploads or references by id: images, SVG, video, PDF, fonts, CSS/JS, CSV, Markdown, JSON and text, up to 20 MiB each (SVG 2 MiB, sanitized). Declare `--capability assets` for the page to use them.
+
+```bash
+claude-artifact assets upload <slug> logo.png chart.svg    # prints id, url, file
+claude-artifact assets list <slug>
+claude-artifact assets get <slug> <id> -o logo.png        # bytes, checked against the sha256
+claude-artifact assets copy <slug> --from <other-slug> <id> ...   # 1-10 ids; prints old -> new
+claude-artifact assets delete <slug> <id>
+```
+
+A page serves an asset at `/_blob/<id>`. `--type` overrides the content type taken from the extension.
+
+### Types
+
+Artifact types (Slides, Docs, Dashboard, Design, Motion, …) are ready-made pages that take your content as data.
+
+```bash
+claude-artifact types list
+claude-artifact types show slides                 # release and the files it ships
+claude-artifact types read slides SKILL.md         # how to fill one
+claude-artifact create slides --title "Q3 review"  # prints the new artifact's URL
+claude-artifact pull <new-slug> ./deck              # then add your files, publish ./deck
+```
+
+`TYPE` is a title (case-insensitive), slug or URL. `create` sends an idempotency key (`--idempotency-key` to reuse one), so a retried create doesn't make a second artifact. `types instances TYPE` lists artifacts made from a type.
+
+### Contract and capabilities
+
+```bash
+claude-artifact contract             # latest runtime contract and its capability names
+claude-artifact contract --prompt    # the guide for page authors: claude.use(...), each capability's config
+```
+
+### Sharing and housekeeping
+
+```bash
+claude-artifact share <slug>                    # audience, people, viewers, commenters
+claude-artifact share <slug> --org              # everyone in your organization
+claude-artifact share <slug> --private          # only you
+claude-artifact share <slug> --add <account-uuid> --access view
+claude-artifact share <slug> --remove <account-uuid>
+claude-artifact versions <slug>
+claude-artifact rename <slug> "New title"       # recorded as a new version
+claude-artifact pin <slug>
+claude-artifact delete <slug> --yes
+```
+
+Sharing is read-modify-write: a change made by someone else in between is refused rather than overwritten. People are named by claude.ai account UUID (`owner_account` in `list --json`, `author.account` in comments for org members); there is no lookup by email. `delete` refuses without `--yes`.
 
 ## Updates
 
@@ -259,6 +389,12 @@ curl -fsSL https://raw.githubusercontent.com/nikships/claude-artifact-cli/main/s
 | `an artifact made from a type can only be patched` | `--mode replace` on a typed directory. Leave `--mode` off. |
 | `…/index.html belongs to the artifact's type and can't be published; remove it` | A typed directory holds an `index.html`. Delete it. |
 | `429 … daily publish cap` | Plan limit. Resets at UTC midnight. |
+| `Claude can only reply on a thread a person sent to Claude` | `comments reply`/`resolve` on a thread without "Send to Claude". Ask the person to send it to Claude, or answer on the page. |
+| `this artifact's published version doesn't declare the db capability` | Republish with `--capability db --capability user`. |
+| `the document changed since --if-version`, exit code `3` | Someone wrote the document since you read it. `db get` it again and redo the write. |
+| `… names a document, not a collection` | A collection path needs an odd number of segments. Split off the last segment as the doc id. |
+| `contract … has no capability …` | A misspelled `--capability`. The error lists the valid names. |
+| `deleting … can't be undone; pass --yes` | `delete` needs `--yes`. |
 
 ## The protocol
 
@@ -269,14 +405,33 @@ POST /api/frame/deploy/direct     publish
 POST /api/frame/deploy/prepare    content-hash preflight (bodies over ~15 MB)
 POST /api/frame/upload            stage blobs the preflight asked for
 GET  /api/frame/{slug}?via=model_read   boot: metadata, file manifest, assetToken
-GET  /api/frame/read/{slug}       ownership / sharing status
+GET  /api/frame/read/{slug}       ownership, stored contract and capabilities
 GET  /api/frame/frames?limit=N    list
+GET  /api/frame/versions/{slug}   version history
+POST /api/frame/retitle/{slug}    rename                    {"title"}
+POST|DELETE /api/frame/favorite/{slug}   pin / unpin
+DELETE /api/frame/{slug}          delete
+GET|PATCH /api/frame/perm/{slug}  sharing (PATCH needs If-Match: <version from GET>)
+
+GET  /api/frame/comments/{slug}?names=1                     threads
+POST /api/frame/comments/{slug}/{thread}                    reply as Claude
+POST /api/frame/comments/{slug}/{thread}/session-resolve    resolve
+POST /api/frame/db/agent                                    database
+POST /api/frame/blob/{slug}/agent-upload|agent-list|agent-copy, /{id}/agent-delete   assets
+
+GET  /api/frame/types[/{slug}[/files/{path}|/instances]]    types
+POST /api/frame/types/{slug}/create?idempotency_key=K       new artifact from a type
+GET  /api/frame/contract/{latest|version}[/prompt]          runtime contract
 
 GET  https://{slug}.frame.claudeusercontent.com/_f/{ver}/_src/{path}?__frame_t=<assetToken>
                                   published source bytes (see Reading files)
 GET  https://{slug}.frame.claudeusercontent.com/_f/{ver}/{path}?__frame_t=<assetToken>
                                   served copy
+GET  https://{slug}.frame.claudeusercontent.com/_f/{ver}/_blob/{id}?__frame_t=<assetToken>
+                                  an uploaded asset
 ```
+
+Every route above answers the OAuth bearer directly. Claude Code routes some of them through a relay in cloud sessions; on a local machine it calls them directly too.
 
 Headers on `api.anthropic.com` calls:
 
@@ -315,7 +470,9 @@ A manifest value with `content` inlines the file; one with `sha256` references a
 
 **Wire encoding.** These content types go as raw UTF-8 strings; everything else is base64: `text/html`, `text/css`, `text/plain`, `text/markdown`, `text/csv`, `text/javascript`, `application/javascript`, `application/json`, `application/manifest+json`, `application/xml`, `text/xml`, `image/svg+xml`.
 
-Response: `{"slug", "version", "read", "shared", "kind"}`. The page lives at `https://claude.ai/code/artifact/<slug>`.
+Optional deploy fields: `description`, `icon`, `label`, `note`, `thumbnail` and `thumbnail_dark` (base64 images), and `contract` with `capabilities` (`{"db": {}, "user": {}}`). `capabilities` requires `contract` (`HTTP 400: capabilities requires contract`); a deploy without `capabilities` keeps the stored declaration, and `{}` clears it. A patch needs a non-empty manifest.
+
+Response: `{"slug", "version", "manifest", "history", "contract", "capabilities", …}`. The page lives at `https://claude.ai/code/artifact/<slug>`.
 
 **Modes and conflicts.** `replace` makes the manifest the whole artifact; `patch` overlays it onto `baseVersion`, keeping paths it doesn't name. Both modes honor `baseVersion`: if the live version is newer, the deploy is refused with
 
@@ -329,6 +486,37 @@ HTTP 409
 ### Large publishes
 
 Over ~15 MB inline, the client switches to `prepare` → `upload` → `deploy`. `prepare` takes `{slug?, shas:[…]}` and answers `{slug, missing:[…]}`. The missing blobs go to `/upload` in batches of at most 15 MB, and the final deploy references them by `sha256`: the hex sha256 of the raw file bytes.
+
+### Copying files from another artifact
+
+A manifest entry can reference a file another artifact already published. First `POST /api/frame/upload` with `{"slug", "files": [{"path": "<dest>", "from": {"slug", "path", "ver"}}]}` (a new artifact reserves its slug with `/deploy/prepare` first), then deploy with `"<dest>": {"sha256": "<source sha256>", "contentType": "…"}`.
+
+### Comments
+
+`GET /comments/{slug}?names=1` answers `{"threads": [...], "names": {account: name}, "viewer"}`. A thread is `{id, created_at, anchor: {path, label, file, file_sha, …}, comments: [...], resolved_at?, resolved_by?, claude_activated_at?}`; a comment is `{id, author: {account, role?}, text, created_at, to_claude_at?}`. `author.role` is set (`"assistant"`) on Claude's comments. `to_claude_at` marks a comment a person sent to Claude.
+
+The OAuth token can reply and resolve only on threads with `claude_activated_at` (a person used "Send to Claude"); elsewhere the server answers `403 Claude is not activated on this thread`. A reply is `POST /comments/{slug}/{thread}` with `{"id": "<client uuid>", "text", "answers_summon"?: true}`; it answers `201 {"thread_id", "comment_id", "replayed"?}` and the same `id` again answers `replayed: true` without posting. Resolve is `POST …/session-resolve` with `{"resolved": true}`. Starting a thread (`POST /comments/{slug}`) and `/resolve` answer `403 this comment action requires a claude.ai session`.
+
+### Database
+
+`POST /api/frame/db/agent` with `{"slug", "verb", "args"}`:
+
+| verb | args |
+|------|------|
+| `whoami` | `{}` → `{"id"}` |
+| `get` | `{"path": "coll/doc"}` → `{exists, data, version, updatedAt}` |
+| `list`, `query` | `{"collection", "limit"?, "cursor"?, "where"?: [{field, op, value}], "orderBy"?: {field, direction}}` → `{docs: [{id, data, version, updatedAt}], nextCursor}` |
+| `set` | `{"path", "data", "replace": true, "ifVersion"?}` |
+| `update` | `{"path", "data", "ifVersion"?}` |
+| `delete` | `{"path", "ifVersion"?}` |
+| `str_replace` | `{"path", "field", "old_str", "new_str", "replace_all"?, "idem": <16 random bytes, base64url>, "ifVersion"?}` |
+| `batch` | `{"ops": [{"op", …the args above}]}` → `{results: [{version?}]}` |
+
+`op` is `eq ne lt lte gt gte in not-in array-contains`. Writes answer `{version, usage}`. Errors are `{"error": {"code", "message", …}}`: `404 not_declared` when the published version doesn't declare `db`, `409 version_mismatch` (with the current `version`) when `ifVersion` is stale.
+
+### Assets
+
+`agent-upload` takes the raw file bytes with the asset's `Content-Type` and answers `{opaque_id, url: "/_blob/<id>", size_bytes, content_type, sha256}`. `agent-list` takes `{"limit", "after"?}` and answers `{assets, usage, next?}`; `agent-copy` takes `{"from": <slug>, "ids": [...]}`; `/{id}/agent-delete` takes `{}` and answers `{"deleted"}`.
 
 ### Reading files
 
@@ -350,9 +538,10 @@ The `assetToken` is redacted from every output and never written to disk.
 
 ### Not supported
 
-- **Delete and pin.** Both go through a relay-only route that isn't reachable on the direct path. Use `/artifacts` in Claude Code, or claude.ai.
-- **Capabilities.** Runtime capability declarations (`capabilities`, `contract`) are accepted by the API but not exposed as flags.
-- **Comments, watching, thumbnails.**
+- **Starting comment threads, or commenting as yourself.** Those routes need a claude.ai browser session.
+- **Artifacts shared from other organizations in `list`.** `GET /frames/external` needs a browser session.
+- **Push notifications.** Claude Code's watch subscribes a webhook (`/subscribe/{slug}`) minted by its own session; `watch` polls instead.
+- **Sharing by email.** The route takes account UUIDs; Claude Code resolves names on an approval card the CLI has no equivalent of.
 
 ## Project Structure
 
@@ -371,7 +560,8 @@ src/
     ├── __main__.py          python -m claude_artifact_cli
     ├── api.py               frame API client
     ├── auth.py              token lookup
-    ├── cli.py               argparse entry point
+    ├── cli.py               argparse entry point; publish, read, pull, status
+    ├── commands.py          comments, db, assets, types, sharing, history, watch
     └── update.py            daily update check, background upgrade, `update`
 tests/                       unit tests (offline; transport mocked)
 AGENTS.md
