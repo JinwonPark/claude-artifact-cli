@@ -4,6 +4,12 @@
 
 # claude-artifact-cli
 
+This personal fork includes a [scoped stdio MCP bridge](docs/scoped-mcp.md)
+for direct read → preview → publish from other coding agents. Run the
+claude-artifact-mcp command with --help after installing this fork. The bridge
+fixes one artifact and one HTML workspace at startup and checks versions before
+publishing. It does not invoke a Claude model; the underlying API remains unofficial.
+
 Publish, update, pull and inspect Claude Artifacts from the terminal, and work with their comments, database, assets, types and sharing, using the Claude Code login already on your machine.
 
 [![PyPI](https://img.shields.io/pypi/v/claude-artifact-cli?style=for-the-badge)](https://pypi.org/project/claude-artifact-cli/)
