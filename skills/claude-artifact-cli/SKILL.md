@@ -18,6 +18,15 @@ metadata:
 
 # claude-artifact CLI
 
+## Scoped MCP entry point in this fork
+
+The claude-artifact-mcp command with --artifact-id UUID and --workspace DIR
+exposes only artifact_read, artifact_preview and artifact_publish. Read the live
+version, edit a local HTML file, preview it against that version, then publish
+the preview ID when the user has authorized the change. The target cannot be
+changed by tool arguments. See docs/scoped-mcp.md for limits and live verification.
+The entry point calls the Python client directly and does not start a Claude model.
+
 A zero-dependency CLI that publishes and manages Claude Artifacts (pages hosted
 on claude.ai) from any shell. It works the same from Droid, Codex, Cursor,
 OpenCode, any other coding agent, a script, or CI. It talks to the artifacts API

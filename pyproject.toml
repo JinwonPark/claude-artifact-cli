@@ -55,6 +55,7 @@ Releases = "https://github.com/nikships/claude-artifact-cli/releases"
 
 [project.scripts]
 claude-artifact = "claude_artifact_cli.cli:main"
+claude-artifact-mcp = "claude_artifact_cli.mcp:main"
 
 [tool.hatch.version]
 path = "src/claude_artifact_cli/__init__.py"
